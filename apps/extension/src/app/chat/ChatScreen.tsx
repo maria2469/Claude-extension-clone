@@ -531,6 +531,10 @@ function formatToolLabel(name: string, input: Record<string, any>): string {
       return `Waiting ${input.seconds}s`;
     case 'screenshot':
       return 'Capturing screenshot';
+    case 'list_tabs':
+      return 'Listing open browser tabs';
+    case 'write_document':
+      return `Writing document (${(input.content as string)?.length || 0} chars)`;
     case 'open_tab':
       return `Opening tab: ${(input.url as string)?.slice(0, 40)}`;
     case 'switch_tab':

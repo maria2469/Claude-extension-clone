@@ -218,160 +218,121 @@ export async function actionScreenshot(): Promise<{ ok: boolean; dataUrl?: strin
 
 // ── Autonomous Document Writing ──────────────────────────────────────────
 
+async function writeViaCdp(
+  tabId: number,
+  text: string,
+  coord?: { x: number; y: number }
+): Promise<boolean> {
+  if (!chrome.debugger?.attach) return false;
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, '1.3');
+    console.log('[EXECUTOR-CDP] Attached debugger to tab', tabId);
+    try {
+      if (coord && coord.x > 0 && coord.y > 0) {
+        await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+          type: 'mousePressed',
+          x: Math.round(coord.x),
+          y: Math.round(coord.y),
+          button: 'left',
+          clickCount: 1,
+        });
+        await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+          type: 'mouseReleased',
+          x: Math.round(coord.x),
+          y: Math.round(coord.y),
+          button: 'left',
+          clickCount: 1,
+        });
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      await chrome.debugger.sendCommand(target, 'Input.insertText', { text });
+      console.log('[EXECUTOR-CDP] Successfully inserted text via Input.insertText');
+      return true;
+    } finally {
+      await chrome.debugger.detach(target).catch(() => {});
+    }
+  } catch (cdpErr) {
+    console.warn('[EXECUTOR-CDP] CDP insertText note:', cdpErr);
+    return false;
+  }
+}
+
 export async function actionWriteDocument(
   content: string,
   title?: string
 ): Promise<ActionResult> {
   console.log('[EXECUTOR] actionWriteDocument called:', { contentLength: content.length, title });
-  const tabId = await getActiveTabId();
-  if (!tabId) return { ok: false, error: 'No active tab' };
 
-  // Check tab URL for Microsoft sign-in page
-  const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  const activeTab = tabs[0];
-  const currentUrl = activeTab?.url || '';
-  console.log('[EXECUTOR] write_document - Current URL:', currentUrl);
+  // 1. Locate the proper editor tab
+  let targetTabId: number | null = await getActiveTabId();
+  const tabs = await chrome.tabs.query({ currentWindow: true });
+  const activeTab = tabs.find((t) => t.id === targetTabId) || tabs.find((t) => t.active);
+  let currentUrl = activeTab?.url || '';
 
+  const isEditorUrl = (u: string) =>
+    u.includes('word.cloud.microsoft') ||
+    u.includes('word.new') ||
+    u.includes('office.com') ||
+    u.includes('docs.live.net') ||
+    u.includes('docs.google.com/document');
+
+  // If current tab is a restricted internal browser tab, switch or open Word
+  if (currentUrl.startsWith('chrome://') || currentUrl.startsWith('chrome-extension://') || currentUrl.startsWith('about:')) {
+    const existingEditorTab = tabs.find((t) => t.url && isEditorUrl(t.url));
+    if (existingEditorTab && existingEditorTab.id) {
+      console.log('[EXECUTOR] Switching from chrome:// to existing Word/Docs tab:', existingEditorTab.id);
+      await chrome.tabs.update(existingEditorTab.id, { active: true });
+      await new Promise((r) => setTimeout(r, 800));
+      targetTabId = existingEditorTab.id;
+      currentUrl = existingEditorTab.url || '';
+    } else {
+      console.log('[EXECUTOR] Opening https://word.new for writing...');
+      const openRes = await actionOpenTab('https://word.new');
+      if (!openRes.ok) return openRes;
+      const updated = await chrome.tabs.query({ active: true, currentWindow: true });
+      targetTabId = updated[0]?.id || targetTabId;
+      currentUrl = updated[0]?.url || 'https://word.new';
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  } else if (!isEditorUrl(currentUrl)) {
+    // If on a regular webpage (e.g. kidodev.com), switch to existing Word tab if one is open
+    const existingEditorTab = tabs.find((t) => t.url && isEditorUrl(t.url));
+    if (existingEditorTab && existingEditorTab.id) {
+      console.log('[EXECUTOR] Switching to existing Word/Docs tab:', existingEditorTab.id, existingEditorTab.url);
+      await chrome.tabs.update(existingEditorTab.id, { active: true });
+      await new Promise((r) => setTimeout(r, 800));
+      targetTabId = existingEditorTab.id;
+      currentUrl = existingEditorTab.url || '';
+    }
+  }
+
+  if (!targetTabId) return { ok: false, error: 'No active tab' };
+
+  // Check for Microsoft sign-in page
   if (currentUrl.includes('login.microsoftonline.com') || currentUrl.includes('account.microsoft.com')) {
     console.log('[EXECUTOR] Microsoft sign-in page detected');
     return {
       ok: false,
-      error: 'Word Online requires Microsoft sign-in on this tab (login.microsoftonline.com). Please complete sign-in first, or switch to an open document tab.',
+      error: 'Word Online requires Microsoft sign-in on this tab (login.microsoftonline.com). Please sign in first, or switch to an open document tab.',
     };
   }
 
-  // For Word Online, use sophisticated formatting approach
-  if (currentUrl.includes('word.new') || currentUrl.includes('word.cloud.microsoft') || currentUrl.includes('docs.live.net')) {
-    console.log('[EXECUTOR] Word Online detected - using formatted document writing');
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        func: (docText: string, docTitle?: string) => {
-          console.log('[EXECUTOR-SCRIPT] Writing formatted document:', { length: docText.length, title: docTitle });
-
-          // Find the document editor
-          const editor = document.querySelector('[contenteditable="true"]') as HTMLElement;
-          if (!editor) {
-            console.log('[EXECUTOR-SCRIPT] No editor found');
-            return { success: false, error: 'No editor found' };
-          }
-
-          console.log('[EXECUTOR-SCRIPT] Found editor:', editor.tagName, editor.id, editor.className);
-          editor.focus();
-
-          // Parse markdown and apply formatting
-          const lines = docText.split('\n');
-          let i = 0;
-
-          const processLine = async () => {
-            if (i >= lines.length) return;
-
-            const line = lines[i];
-            const trimmedLine = line.trim();
-
-            // Skip empty lines (but add paragraph breaks)
-            if (!trimmedLine) {
-              document.execCommand('insertParagraph', false);
-              i++;
-              setTimeout(processLine, 50);
-              return;
-            }
-
-            // Headers
-            if (trimmedLine.startsWith('### ')) {
-              document.execCommand('formatBlock', false, 'H3');
-              document.execCommand('insertText', false, trimmedLine.replace('### ', ''));
-              document.execCommand('insertParagraph', false);
-            }
-            else if (trimmedLine.startsWith('## ')) {
-              document.execCommand('formatBlock', false, 'H2');
-              document.execCommand('insertText', false, trimmedLine.replace('## ', ''));
-              document.execCommand('insertParagraph', false);
-            }
-            else if (trimmedLine.startsWith('# ')) {
-              document.execCommand('formatBlock', false, 'H1');
-              document.execCommand('insertText', false, trimmedLine.replace('# ', ''));
-              document.execCommand('insertParagraph', false);
-            }
-            // Bold text
-            else if (trimmedLine.startsWith('**') && trimmedLine.endsWith('**')) {
-              document.execCommand('bold', false);
-              document.execCommand('insertText', false, trimmedLine.replace(/\*\*/g, ''));
-              document.execCommand('bold', false);
-              document.execCommand('insertParagraph', false);
-            }
-            // Italic text
-            else if (trimmedLine.startsWith('*') && trimmedLine.endsWith('*') && !trimmedLine.startsWith('**')) {
-              document.execCommand('italic', false);
-              document.execCommand('insertText', false, trimmedLine.replace(/\*/g, ''));
-              document.execCommand('italic', false);
-              document.execCommand('insertParagraph', false);
-            }
-            // Bullet points
-            else if (trimmedLine.startsWith('- ') || trimmedLine.startsWith('* ')) {
-              document.execCommand('insertUnorderedList', false);
-              document.execCommand('insertText', false, trimmedLine.replace(/^[-*]\s+/, ''));
-              document.execCommand('insertUnorderedList', false);
-            }
-            // Numbered lists
-            else if (/^\d+\.\s+/.test(trimmedLine)) {
-              document.execCommand('insertOrderedList', false);
-              document.execCommand('insertText', false, trimmedLine.replace(/^\d+\.\s+/, ''));
-              document.execCommand('insertOrderedList', false);
-            }
-            // Regular paragraph
-            else {
-              // Check for inline formatting
-              let processedLine = line;
-              
-              // Apply inline bold
-              const boldRegex = /\*\*(.*?)\*\*/g;
-              if (boldRegex.test(processedLine)) {
-                processedLine = processedLine.replace(boldRegex, (match, text) => {
-                  document.execCommand('bold', false);
-                  document.execCommand('insertText', false, text);
-                  document.execCommand('bold', false);
-                  return '';
-                });
-              }
-              
-              // If no inline formatting, just insert as normal text
-              if (processedLine) {
-                document.execCommand('insertText', false, processedLine);
-              }
-              document.execCommand('insertParagraph', false);
-            }
-
-            i++;
-            setTimeout(processLine, 100);
-          };
-
-          processLine();
-
-          return { success: true, linesProcessed: lines.length };
-        },
-        args: [content, title],
-      });
-
-      // Wait for typing to complete
-      const lineCount = content.split('\n').length;
-      await new Promise(r => setTimeout(r, lineCount * 100 + 1000));
-
-      return { ok: true, output: 'Document written with full formatting control' };
-    } catch (e: any) {
-      console.log('[EXECUTOR] Formatted writing failed:', e);
-      // Fall through to the regular approach
+  // Copy document content to system clipboard so it is immediately available for paste
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(content);
+      console.log('[EXECUTOR] Copied document content to system clipboard');
     }
+  } catch (clipErr) {
+    console.warn('[EXECUTOR] Clipboard write warning:', clipErr);
   }
 
-  // Regular approach for other editors or if clipboard failed
-  // Inject across all frames so nested Word Online iframe editors are found
   try {
     const results = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
+      target: { tabId: targetTabId, allFrames: true },
       func: async (docText: string, docTitle?: string) => {
-        console.log('[EXECUTOR-SCRIPT] write_document injected:', { docTextLength: docText.length, docTitle });
-        console.log('[EXECUTOR-SCRIPT] Current page URL:', window.location.href);
+        console.log('[EXECUTOR-SCRIPT] write_document starting in frame:', window.location.href);
 
         function mdToHtml(md: string): string {
           return md
@@ -390,152 +351,228 @@ export async function actionWriteDocument(
 
         const html = mdToHtml(docText);
 
-        // Target candidates for Word Online, Google Docs, OneNote, Notion, rich text
-        const candidateSelectors = [
-          '[contenteditable="true"]',
-          '[role="textbox"]',
-          '[role="document"]',
+        function getByXPath(xpath: string): HTMLElement | null {
+          try {
+            const res = document.evaluate(
+              xpath,
+              document,
+              null,
+              XPathResult.FIRST_ORDERED_NODE_TYPE,
+              null
+            );
+            return res.singleNodeValue as HTMLElement | null;
+          } catch {
+            return null;
+          }
+        }
+
+        // Candidates: 1. User-provided exact XPath, 2. Form relative XPath, 3. Standard Word/Docs selectors
+        const userXPath =
+          '/html/body/div[5]/form/div/div/div/div[1]/div[1]/div/div[11]/div/div[10]/div/div/div[1]/div[4]/div/div/div/div[3]/div/div[1]';
+        const formRelativeXPath =
+          '//form/div/div/div/div[1]/div[1]/div/div[11]/div/div[10]/div/div/div[1]/div[4]/div/div/div/div[3]/div/div[1]';
+        const formCanvasXPath =
+          '//form//div[contains(@class, "Canvas") or contains(@class, "Editing") or @role="textbox" or @role="document" or @contenteditable="true"]';
+
+        const candidates: HTMLElement[] = [];
+
+        const elUser = getByXPath(userXPath);
+        if (elUser) candidates.push(elUser);
+
+        const elFormRel = getByXPath(formRelativeXPath);
+        if (elFormRel && !candidates.includes(elFormRel)) candidates.push(elFormRel);
+
+        const elFormCanvas = getByXPath(formCanvasXPath);
+        if (elFormCanvas && !candidates.includes(elFormCanvas)) candidates.push(elFormCanvas);
+
+        const selectorList = [
           '.WACViewPanel_EditingElement',
           '#WACViewPanel_EditingElement',
-          '.kix-appview-editor',
-          '.docs-texteventtarget-iframe',
           '[data-automation-id="CanvasZone"]',
           '[data-automation-id="Canvas"]',
+          '[data-automation-id="documentCanvas"]',
+          '.WordDocumentCanvas',
+          '[role="textbox"]',
+          '[contenteditable="true"]',
+          '[role="document"]',
+          '.kix-appview-editor',
+          '.docs-texteventtarget-iframe',
           '.editor-content',
-          'textarea',
         ];
 
-        const candidates = candidateSelectors.map(sel => {
-          const el = document.querySelector(sel) as HTMLElement;
-          if (el) console.log('[EXECUTOR-SCRIPT] Found candidate:', sel, el.tagName, el.id, el.className);
-          return el;
-        }).filter(Boolean) as HTMLElement[];
+        for (const sel of selectorList) {
+          const found = document.querySelector<HTMLElement>(sel);
+          if (found && !candidates.includes(found)) candidates.push(found);
+        }
 
-        // Also try to find all contenteditable elements and add them
-        const allContentEditable = Array.from(document.querySelectorAll('[contenteditable="true"]')) as HTMLElement[];
-        console.log('[EXECUTOR-SCRIPT] Found', allContentEditable.length, 'contenteditable elements');
-        allContentEditable.forEach(el => {
-          if (!candidates.includes(el)) {
-            console.log('[EXECUTOR-SCRIPT] Adding contenteditable:', el.tagName, el.id, el.className);
-            candidates.push(el);
-          }
+        // Add any contenteditables on page
+        document.querySelectorAll<HTMLElement>('[contenteditable="true"]').forEach((el) => {
+          if (!candidates.includes(el)) candidates.push(el);
         });
 
-        candidates.push(document.activeElement as HTMLElement);
-        candidates.push(document.body);
-
-        console.log('[EXECUTOR-SCRIPT] Total candidates found:', candidates.length);
-
-        let target: HTMLElement | null = null;
-        for (const el of candidates) {
-          if (el && el !== document.body && el.tagName !== 'HTML') {
-            target = el;
-            console.log('[EXECUTOR-SCRIPT] Selected target:', target.tagName, target.id, target.className);
-            break;
-          }
-        }
-        if (!target) {
-          target = document.body;
-          console.log('[EXECUTOR-SCRIPT] Using document.body as fallback');
+        if (document.activeElement && document.activeElement !== document.body) {
+          candidates.push(document.activeElement as HTMLElement);
         }
 
-        if (!target) return { ok: false, error: 'No editable target found' };
+        // Filter and choose primary target
+        let target: HTMLElement | null = candidates.find(
+          (c) => c && c !== document.body && c.tagName !== 'HTML'
+        ) || null;
 
-        console.log('[EXECUTOR-SCRIPT] Final target:', target.tagName, target.id, target.className, target.isContentEditable);
-        console.log('[EXECUTOR-SCRIPT] Target current content length:', target.innerText?.length || 0);
-        target.focus();
+        if (!target) return { ok: false, error: 'No target candidate found in frame' };
+
+        console.log('[EXECUTOR-SCRIPT] Targeting element:', target.tagName, target.id, target.className);
+
+        let clickCoord = { x: 0, y: 0 };
+
+        // 1. Scroll into view and click center to activate Word Online cursor
+        try {
+          target.scrollIntoView({ behavior: 'instant', block: 'center' });
+          const rect = target.getBoundingClientRect();
+          clickCoord = {
+            x: rect.left + Math.max(10, rect.width / 2),
+            y: rect.top + Math.max(10, rect.height / 2),
+          };
+
+          target.dispatchEvent(
+            new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window, clientX: clickCoord.x, clientY: clickCoord.y })
+          );
+          target.dispatchEvent(
+            new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window, clientX: clickCoord.x, clientY: clickCoord.y })
+          );
+          target.dispatchEvent(
+            new MouseEvent('click', { bubbles: true, cancelable: true, view: window, clientX: clickCoord.x, clientY: clickCoord.y })
+          );
+        } catch {}
+
+        await new Promise((r) => setTimeout(r, 100));
+
+        // If clicking caused Word Online to focus its internal helper, use document.activeElement
+        const writeTarget = (document.activeElement && document.activeElement !== document.body)
+          ? (document.activeElement as HTMLElement)
+          : target;
+
+        try { writeTarget.focus(); } catch {}
+
         let success = false;
 
-        // Method 1: ClipboardEvent paste
+        // Method A: ClipboardEvent paste with HTML and plain text
         try {
-          console.log('[EXECUTOR-SCRIPT] Trying Method 1: ClipboardEvent paste');
           const dt = new DataTransfer();
           dt.setData('text/plain', docText);
           dt.setData('text/html', html);
-          const ev = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
-          target.dispatchEvent(ev);
+
+          const pasteEv = new ClipboardEvent('paste', {
+            bubbles: true,
+            cancelable: true,
+            clipboardData: dt,
+          });
+
+          writeTarget.dispatchEvent(pasteEv);
+          target.dispatchEvent(pasteEv);
+          document.dispatchEvent(pasteEv);
+          window.dispatchEvent(pasteEv);
           success = true;
-          console.log('[EXECUTOR-SCRIPT] Method 1 succeeded');
+          console.log('[EXECUTOR-SCRIPT] Method A (paste event) dispatched');
         } catch (e) {
-          console.log('[EXECUTOR-SCRIPT] Method 1 failed:', e);
+          console.log('[EXECUTOR-SCRIPT] Method A error:', e);
         }
 
-        // Method 2: document.execCommand
+        // Method B: InputEvent (beforeinput + input)
         try {
-          console.log('[EXECUTOR-SCRIPT] Trying Method 2: execCommand');
+          writeTarget.dispatchEvent(
+            new InputEvent('beforeinput', {
+              bubbles: true,
+              cancelable: true,
+              data: docText,
+              inputType: 'insertText',
+            })
+          );
+          writeTarget.dispatchEvent(
+            new InputEvent('input', {
+              bubbles: true,
+              data: docText,
+              inputType: 'insertText',
+            })
+          );
+          success = true;
+          console.log('[EXECUTOR-SCRIPT] Method B (InputEvent) dispatched');
+        } catch (e) {
+          console.log('[EXECUTOR-SCRIPT] Method B error:', e);
+        }
+
+        // Method C: execCommand insertHTML or insertText
+        try {
           if (document.queryCommandSupported && document.queryCommandSupported('insertHTML')) {
             document.execCommand('insertHTML', false, html);
             success = true;
-            console.log('[EXECUTOR-SCRIPT] Method 2 (insertHTML) succeeded');
           } else if (document.queryCommandSupported && document.queryCommandSupported('insertText')) {
             document.execCommand('insertText', false, docText);
             success = true;
-            console.log('[EXECUTOR-SCRIPT] Method 2 (insertText) succeeded');
           }
-        } catch (e) {
-          console.log('[EXECUTOR-SCRIPT] Method 2 failed:', e);
-        }
+        } catch (e) {}
 
-        // Method 3: Direct contenteditable insertion if empty
-        if (target.isContentEditable && (!target.innerText || target.innerText.trim().length === 0)) {
-          console.log('[EXECUTOR-SCRIPT] Trying Method 3: Direct innerHTML (empty)');
-          target.innerHTML = html;
-          target.dispatchEvent(new Event('input', { bubbles: true }));
-          success = true;
-          console.log('[EXECUTOR-SCRIPT] Method 3 succeeded');
-        }
-
-        // Method 4: Try using the Clipboard API (async, but worth a shot)
-        if (!success && navigator.clipboard && navigator.clipboard.writeText) {
-          console.log('[EXECUTOR-SCRIPT] Trying Method 4: Clipboard API');
-          try {
-            await navigator.clipboard.writeText(docText);
-            console.log('[EXECUTOR-SCRIPT] Clipboard API write succeeded');
-            // Trigger paste
-            document.execCommand('paste');
+        // Method D: If contenteditable element or child exists, set innerHTML/innerText directly
+        try {
+          const editable = writeTarget.isContentEditable
+            ? writeTarget
+            : target.isContentEditable
+            ? target
+            : target.querySelector<HTMLElement>('[contenteditable="true"]');
+          if (editable) {
+            editable.innerHTML = html;
+            editable.dispatchEvent(new Event('input', { bubbles: true }));
+            editable.dispatchEvent(new Event('change', { bubbles: true }));
             success = true;
-            console.log('[EXECUTOR-SCRIPT] Method 4 succeeded');
-          } catch (e) {
-            console.log('[EXECUTOR-SCRIPT] Method 4 failed:', e);
+            console.log('[EXECUTOR-SCRIPT] Method D (direct editable insertion) succeeded');
           }
-        }
+        } catch (e) {}
 
-        // Method 5: Force innerHTML for contenteditable (even if not empty)
-        if (!success && target.isContentEditable) {
-          console.log('[EXECUTOR-SCRIPT] Trying Method 5: Force innerHTML');
-          const currentContent = target.innerHTML;
-          target.innerHTML = html;
-          target.dispatchEvent(new Event('input', { bubbles: true }));
-          target.dispatchEvent(new Event('change', { bubbles: true }));
-          success = true;
-          console.log('[EXECUTOR-SCRIPT] Method 5 succeeded (replaced content)');
-        }
-
-        // Set document title if title input is found
+        // Optional title set
         if (docTitle) {
-          const titleEl = document.querySelector<HTMLInputElement>(
-            '[data-automation-id="documentTitle"], #documentTitle, input[aria-label*="Document Name"]'
-          );
-          if (titleEl) {
-            titleEl.value = docTitle;
-            titleEl.dispatchEvent(new Event('input', { bubbles: true }));
-            titleEl.dispatchEvent(new Event('change', { bubbles: true }));
-          }
+          try {
+            const titleEl = document.querySelector<HTMLInputElement>(
+              '[data-automation-id="documentTitle"], #documentTitle, input[aria-label*="Document Name"]'
+            );
+            if (titleEl) {
+              titleEl.value = docTitle;
+              titleEl.dispatchEvent(new Event('input', { bubbles: true }));
+              titleEl.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          } catch {}
         }
 
-        return { ok: success, tag: target.tagName, url: window.location.href };
+        return { ok: success, coord: clickCoord, tag: writeTarget.tagName, url: window.location.href };
       },
       args: [content, title || ''],
     });
 
+    // Check if any frame returned coordinates and try native CDP insertion
+    const frameWithCoord = results.find((r) => (r.result as any)?.coord?.x > 0);
+    const coord = (frameWithCoord?.result as any)?.coord;
+
+    if (targetTabId && coord) {
+      console.log('[EXECUTOR] Attempting native CDP text insertion at', coord);
+      const cdpOk = await writeViaCdp(targetTabId, content, coord);
+      if (cdpOk) {
+        return {
+          ok: true,
+          output: `Successfully written ${content.length} characters into the Word Online document editor via native browser pipeline.`,
+        };
+      }
+    }
+
     const anySuccess = results.some((r) => (r.result as any)?.ok);
     if (anySuccess) {
-      return { ok: true, output: `Successfully wrote document (${content.length} characters) into editor` };
+      return {
+        ok: true,
+        output: `Successfully written ${content.length} characters into the Word Online document editor.`,
+      };
     }
 
     return {
       ok: true,
-      output: `Document content (${content.length} characters) dispatched to active editor surface.`,
+      output: `Document content (${content.length} characters) dispatched to Word Online editor and copied to system clipboard.`,
     };
   } catch (err: any) {
     return { ok: false, error: `write_document failed: ${err?.message || err}` };
@@ -543,6 +580,24 @@ export async function actionWriteDocument(
 }
 
 // ── Multi-tab tools ────────────────────────────────────────────────────────
+
+export async function actionListTabs(): Promise<ActionResult> {
+  try {
+    const tabs = await chrome.tabs.query({ currentWindow: true });
+    if (!tabs || tabs.length === 0) {
+      return { ok: true, output: 'No tabs found in current window.' };
+    }
+    const lines = tabs.map(
+      (t) => `• [Tab ${t.id}] "${t.title || 'Untitled'}" — URL: ${t.url || 'about:blank'}${t.active ? ' (active)' : ''}`
+    );
+    return {
+      ok: true,
+      output: `Found ${tabs.length} tabs in current window:\n${lines.join('\n')}`,
+    };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || 'list_tabs failed' };
+  }
+}
 
 export async function actionOpenTab(url: string): Promise<ActionResult> {
   try {
@@ -636,6 +691,9 @@ export async function dispatchToolUse(block: ToolUseBlock): Promise<{
         result = { ok: ss.ok, output: ss.dataUrl ? '[screenshot captured]' : undefined, error: ss.error };
         break;
       }
+      case 'list_tabs':
+        result = await actionListTabs();
+        break;
       case 'open_tab':
         result = await actionOpenTab(block.input.url as string);
         break;

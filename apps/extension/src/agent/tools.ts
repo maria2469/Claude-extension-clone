@@ -121,6 +121,17 @@ export const BROWSER_TOOLS = [
     },
   },
   {
+    name: 'list_tabs',
+    description:
+      'List all currently open tabs in the browser window with their tab IDs, titles, URLs, and active status. ' +
+      'Always call this tool first whenever the user asks about open tabs, or wants to summarize or inspect open tabs.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  },
+  {
     name: 'open_tab',
     description:
       'Open a new browser tab with the given URL. The tab will be added to the Malude Agent tab group.',
