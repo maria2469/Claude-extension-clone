@@ -109,9 +109,9 @@ def _convert_tools_for_groq(tools: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 GEMINI_CANDIDATE_MODELS = [
+    "gemini-flash-lite-latest",
     "gemini-3.6-flash",
     "gemini-3-flash-preview",
-    "gemini-flash-lite-latest",
     "gemini-3.5-flash-lite",
 ]
 
@@ -141,12 +141,11 @@ async def _stream_gemini(
             "model": gem_model,
             "messages": conv_messages,
             "stream": True,
+            "max_tokens": max(max_tokens or 2048, 4096),
         }
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
-        if max_tokens:
-            body["max_tokens"] = min(max_tokens, 2048)
 
         full_text: list[str] = []
         accumulated_tool_calls: dict[int, dict[str, Any]] = {}
@@ -349,12 +348,25 @@ class Llm:
                     if ("429" in err_str or "rate_limit" in err_str.lower()) and attempt < max_retries:
                         m = re.search(r"try again in ([\d\.]+)s", err_str)
                         wait_sec = float(m.group(1)) + 0.5 if m else 3.0
+                        if wait_sec > 5.0:
+                            _logger.warning("[AGENT] Groq wait time %.1fs is too long (daily token limit). Switching to fallback...", wait_sec)
+                            break
                         _logger.warning("[AGENT] 429 rate limit on Groq. Pausing %.1fs (attempt %d/%d)...", wait_sec, attempt + 1, max_retries)
                         await asyncio.sleep(wait_sec)
                         continue
-                    _logger.warning("[AGENT] Groq stream request failed: %s. Falling back to Gemini...", e)
+                    _logger.warning("[AGENT] Groq stream request failed: %s. Falling back...", e)
                     stream = None
                     break
+
+            if stream is None and model != settings.MODEL_FAST:
+                try:
+                    _logger.info("[AGENT] Trying Groq fast model (%s)...", settings.MODEL_FAST)
+                    create_kwargs["model"] = settings.MODEL_FAST
+                    stream = await groq_client.chat.completions.create(**create_kwargs)
+                    _logger.info("[AGENT] Groq fast model stream created successfully")
+                except Exception as e:
+                    _logger.warning("[AGENT] Groq fast model also failed: %s", e)
+                    stream = None
 
             if stream is not None:
                 try:

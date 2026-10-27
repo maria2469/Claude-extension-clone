@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     MODEL_AGENT: str = "openai/gpt-oss-120b"
     MODEL_FAST: str = "openai/gpt-oss-20b"
-    MODEL_GEMINI: str = "gemini-3.6-flash"
+    MODEL_GEMINI: str = "gemini-flash-lite-latest"
 
     SUPABASE_URL: str = ""
     SUPABASE_JWKS_URL: str = ""

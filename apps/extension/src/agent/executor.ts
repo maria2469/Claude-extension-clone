@@ -240,54 +240,126 @@ export async function actionWriteDocument(
     };
   }
 
-  // For Word Online, try clipboard-based approach as primary method
+  // For Word Online, use sophisticated formatting approach
   if (currentUrl.includes('word.new') || currentUrl.includes('word.cloud.microsoft') || currentUrl.includes('docs.live.net')) {
-    console.log('[EXECUTOR] Word Online detected - using clipboard approach');
+    console.log('[EXECUTOR] Word Online detected - using formatted document writing');
     try {
-      // Copy content to clipboard
       await chrome.scripting.executeScript({
         target: { tabId },
-        func: (text: string) => {
-          console.log('[EXECUTOR-SCRIPT] Copying to clipboard:', text.slice(0, 100));
-          // Create a textarea to copy from
-          const textarea = document.createElement('textarea');
-          textarea.value = text;
-          textarea.style.position = 'fixed';
-          textarea.style.opacity = '0';
-          document.body.appendChild(textarea);
-          textarea.select();
-          document.execCommand('copy');
-          document.body.removeChild(textarea);
-          console.log('[EXECUTOR-SCRIPT] Copied to clipboard successfully');
-          return { copied: true };
-        },
-        args: [content],
-      });
+        func: (docText: string, docTitle?: string) => {
+          console.log('[EXECUTOR-SCRIPT] Writing formatted document:', { length: docText.length, title: docTitle });
 
-      // Wait a moment for clipboard to be ready
-      await new Promise(r => setTimeout(r, 500));
-
-      // Trigger paste in the document
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          console.log('[EXECUTOR-SCRIPT] Attempting to paste');
-          // Try to find the document body and focus it
-          const contentEditable = document.querySelector('[contenteditable="true"]') as HTMLElement;
-          if (contentEditable) {
-            contentEditable.focus();
-            document.execCommand('paste');
-            console.log('[EXECUTOR-SCRIPT] Paste command executed');
-            return { pasted: true };
+          // Find the document editor
+          const editor = document.querySelector('[contenteditable="true"]') as HTMLElement;
+          if (!editor) {
+            console.log('[EXECUTOR-SCRIPT] No editor found');
+            return { success: false, error: 'No editor found' };
           }
-          console.log('[EXECUTOR-SCRIPT] No contenteditable found for paste');
-          return { pasted: false };
+
+          console.log('[EXECUTOR-SCRIPT] Found editor:', editor.tagName, editor.id, editor.className);
+          editor.focus();
+
+          // Parse markdown and apply formatting
+          const lines = docText.split('\n');
+          let i = 0;
+
+          const processLine = async () => {
+            if (i >= lines.length) return;
+
+            const line = lines[i];
+            const trimmedLine = line.trim();
+
+            // Skip empty lines (but add paragraph breaks)
+            if (!trimmedLine) {
+              document.execCommand('insertParagraph', false);
+              i++;
+              setTimeout(processLine, 50);
+              return;
+            }
+
+            // Headers
+            if (trimmedLine.startsWith('### ')) {
+              document.execCommand('formatBlock', false, 'H3');
+              document.execCommand('insertText', false, trimmedLine.replace('### ', ''));
+              document.execCommand('insertParagraph', false);
+            }
+            else if (trimmedLine.startsWith('## ')) {
+              document.execCommand('formatBlock', false, 'H2');
+              document.execCommand('insertText', false, trimmedLine.replace('## ', ''));
+              document.execCommand('insertParagraph', false);
+            }
+            else if (trimmedLine.startsWith('# ')) {
+              document.execCommand('formatBlock', false, 'H1');
+              document.execCommand('insertText', false, trimmedLine.replace('# ', ''));
+              document.execCommand('insertParagraph', false);
+            }
+            // Bold text
+            else if (trimmedLine.startsWith('**') && trimmedLine.endsWith('**')) {
+              document.execCommand('bold', false);
+              document.execCommand('insertText', false, trimmedLine.replace(/\*\*/g, ''));
+              document.execCommand('bold', false);
+              document.execCommand('insertParagraph', false);
+            }
+            // Italic text
+            else if (trimmedLine.startsWith('*') && trimmedLine.endsWith('*') && !trimmedLine.startsWith('**')) {
+              document.execCommand('italic', false);
+              document.execCommand('insertText', false, trimmedLine.replace(/\*/g, ''));
+              document.execCommand('italic', false);
+              document.execCommand('insertParagraph', false);
+            }
+            // Bullet points
+            else if (trimmedLine.startsWith('- ') || trimmedLine.startsWith('* ')) {
+              document.execCommand('insertUnorderedList', false);
+              document.execCommand('insertText', false, trimmedLine.replace(/^[-*]\s+/, ''));
+              document.execCommand('insertUnorderedList', false);
+            }
+            // Numbered lists
+            else if (/^\d+\.\s+/.test(trimmedLine)) {
+              document.execCommand('insertOrderedList', false);
+              document.execCommand('insertText', false, trimmedLine.replace(/^\d+\.\s+/, ''));
+              document.execCommand('insertOrderedList', false);
+            }
+            // Regular paragraph
+            else {
+              // Check for inline formatting
+              let processedLine = line;
+              
+              // Apply inline bold
+              const boldRegex = /\*\*(.*?)\*\*/g;
+              if (boldRegex.test(processedLine)) {
+                processedLine = processedLine.replace(boldRegex, (match, text) => {
+                  document.execCommand('bold', false);
+                  document.execCommand('insertText', false, text);
+                  document.execCommand('bold', false);
+                  return '';
+                });
+              }
+              
+              // If no inline formatting, just insert as normal text
+              if (processedLine) {
+                document.execCommand('insertText', false, processedLine);
+              }
+              document.execCommand('insertParagraph', false);
+            }
+
+            i++;
+            setTimeout(processLine, 100);
+          };
+
+          processLine();
+
+          return { success: true, linesProcessed: lines.length };
         },
+        args: [content, title],
       });
 
-      return { ok: true, output: 'Content copied to clipboard and pasted into document' };
+      // Wait for typing to complete
+      const lineCount = content.split('\n').length;
+      await new Promise(r => setTimeout(r, lineCount * 100 + 1000));
+
+      return { ok: true, output: 'Document written with full formatting control' };
     } catch (e: any) {
-      console.log('[EXECUTOR] Clipboard approach failed:', e);
+      console.log('[EXECUTOR] Formatted writing failed:', e);
       // Fall through to the regular approach
     }
   }
