@@ -1,0 +1,11 @@
+{
+  "name": "malude",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Malude Chrome Extension Monorepo",
+  "scripts": {
+    "dev": "npm --prefix apps/extension run dev",
+    "build": "npm --prefix apps/extension run build",
+    "test": "npm --prefix apps/extension test"
+  }
+}

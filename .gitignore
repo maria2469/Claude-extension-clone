@@ -1,0 +1,48 @@
+
+
+# Environment variables
+.env
+.venv
+
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-debug.log
+
+# FastAPI
+.env
+.venv
+
+# WXT
+.wxt/
+.output/
+
+# Vite
+.vite/
+
+# TypeScript
+*.tsbuildinfo
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# IDE settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS generated
+.DS_Store
+Thumbs.db
+
