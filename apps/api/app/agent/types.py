@@ -9,7 +9,7 @@ class StepRequest(BaseModel):
     page_title: str | None = Field(default=None, max_length=1024)
     page_content: str | None = Field(default=None, max_length=200000)
     run_id: str | None = Field(default=None, max_length=64)
-    max_tokens: int = Field(default=2048, ge=1, le=8192)
+    max_tokens: int = Field(default=4096, ge=1, le=8192)
 
 
 class ReviewRequest(BaseModel):

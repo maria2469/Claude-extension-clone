@@ -25,8 +25,7 @@ export const BROWSER_TOOLS = [
   {
     name: 'type',
     description:
-      'Type text into a standard input field, search box, or textarea. ' +
-      'Do not use this to type documents into Word Online or Google Docs canvas. Use press_enter=true for search.',
+      'Type text into a standard input field, search box, textarea, or contenteditable editor. Use press_enter=true for search queries.',
     input_schema: {
       type: 'object',
       properties: {
@@ -39,6 +38,26 @@ export const BROWSER_TOOLS = [
         },
       },
       required: ['ref', 'text'],
+    },
+  },
+  {
+    name: 'write_document',
+    description:
+      'Autonomously write and insert formatted document content directly into the active document editor (Word Online, Google Docs, OneNote, Notion, or rich-text web editors). ' +
+      'Automatically finds the editing canvas/surface and writes the formatted document directly into the page.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        content: {
+          type: 'string',
+          description: 'The complete document content to write, formatted with headings, bullet points, sections, and tables',
+        },
+        title: {
+          type: 'string',
+          description: 'Optional document title to set in the document header',
+        },
+      },
+      required: ['content'],
     },
   },
   {

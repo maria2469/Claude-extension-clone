@@ -42,6 +42,29 @@ async function getActiveTabDetails(): Promise<{
       return { tabId, url, title: title || null, content: null };
     }
 
+    console.log('[Malude Tab] Getting details for:', url);
+
+    // Special handling for Word Online - always provide content indicator
+    if (url.includes('word.new') || url.includes('word.cloud.microsoft') || url.includes('docs.live.net')) {
+      console.log('[Malude Tab] Word Online detected - using specialized extraction');
+      try {
+        const response = await chrome.tabs.sendMessage(tabId, { type: 'dom.extract' });
+        if (response?.ok && response?.data) {
+          const { treeText, pageText, elements } = response.data;
+          const combined = [
+            treeText ? `=== Interactive Elements (${elements?.length || 0} items) ===\n${treeText}\n` : '',
+            pageText ? `=== Page Text ===\n${pageText}` : '',
+          ].filter(Boolean).join('\n');
+          console.log('[Malude Tab] Word Online content extracted:', combined.length);
+          return { tabId, url, title: title || null, content: combined || '[Word Online Document Editor]' };
+        }
+      } catch (e) {
+        console.log('[Malude Tab] Content script failed for Word Online:', e);
+      }
+      // Fallback if content script fails
+      return { tabId, url, title: title || null, content: '[Word Online Document Editor - Ready for content]' };
+    }
+
     // Try content script first (structured DOM map)
     try {
       const response = await chrome.tabs.sendMessage(tabId, { type: 'dom.extract' });

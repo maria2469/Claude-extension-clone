@@ -15,11 +15,17 @@ _logger = logging.getLogger(__name__)
 
 def _get_groq_client() -> AsyncGroq | None:
     if settings.GROQ_API_KEY:
+        _logger.info("[AGENT] Groq client initialized with API key")
         return AsyncGroq(api_key=settings.GROQ_API_KEY)
+    _logger.warning("[AGENT] No Groq API key found")
     return None
 
 
 def _get_anthropic_client() -> AsyncAnthropic:
+    if settings.ANTHROPIC_API_KEY and not settings.ANTHROPIC_API_KEY.startswith("dummy"):
+        _logger.info("[AGENT] Anthropic client initialized")
+    else:
+        _logger.warning("[AGENT] No valid Anthropic API key - using dummy")
     return AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY or "dummy-key-for-init")
 
 
@@ -102,140 +108,195 @@ def _convert_tools_for_groq(tools: list[dict[str, Any]]) -> list[dict[str, Any]]
     return result
 
 
+GEMINI_CANDIDATE_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3-flash-preview",
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash-lite",
+]
+
+
 async def _stream_gemini(
     conv_messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
     max_tokens: int | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Stream completions from Google Gemini via its OpenAI-compatible endpoint."""
+    """Stream completions from Google Gemini via its OpenAI-compatible endpoint with model cascade."""
     url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
     headers = {
         "Authorization": f"Bearer {settings.GEMINI_API_KEY}",
         "Content-Type": "application/json",
     }
-    body: dict[str, Any] = {
-        "model": settings.MODEL_GEMINI or "gemini-2.5-flash",
-        "messages": conv_messages,
-        "stream": True,
-    }
-    if tools:
-        body["tools"] = tools
-        body["tool_choice"] = "auto"
-    if max_tokens:
-        body["max_tokens"] = min(max_tokens, 2048)
+    
+    models_to_try = []
+    if settings.MODEL_GEMINI and settings.MODEL_GEMINI not in models_to_try:
+        models_to_try.append(settings.MODEL_GEMINI)
+    for m in GEMINI_CANDIDATE_MODELS:
+        if m not in models_to_try:
+            models_to_try.append(m)
 
-    full_text: list[str] = []
-    accumulated_tool_calls: dict[int, dict[str, Any]] = {}
-    finish_reason = "end_turn"
+    last_error: Exception | None = None
+    for gem_model in models_to_try:
+        body: dict[str, Any] = {
+            "model": gem_model,
+            "messages": conv_messages,
+            "stream": True,
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        if max_tokens:
+            body["max_tokens"] = min(max_tokens, 2048)
 
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        async with client.stream("POST", url, headers=headers, json=body) as response:
-            if response.status_code != 200:
-                raw_err = await response.aread()
-                raise RuntimeError(
-                    f"Gemini API returned status {response.status_code}: {raw_err.decode('utf-8', errors='replace')[:400]}"
-                )
+        full_text: list[str] = []
+        accumulated_tool_calls: dict[int, dict[str, Any]] = {}
+        finish_reason = "end_turn"
 
-            async for line in response.aiter_lines():
-                line = line.strip()
-                if not line or not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
-                    break
-
-                try:
-                    chunk = _json.loads(data_str)
-                except Exception:
-                    continue
-
-                if not chunk.get("choices"):
-                    continue
-                choice = chunk["choices"][0]
-                delta = choice.get("delta") or {}
-
-                # Text delta
-                if delta.get("content"):
-                    c_delta = delta["content"]
-                    full_text.append(c_delta)
-                    yield {"type": "text", "delta": c_delta}
-
-                # Tool calls
-                if delta.get("tool_calls"):
-                    for tc in delta["tool_calls"]:
-                        idx = tc.get("index", 0)
-                        if idx not in accumulated_tool_calls:
-                            accumulated_tool_calls[idx] = {
-                                "id": tc.get("id") or "",
-                                "name": tc.get("function", {}).get("name") if tc.get("function") else "",
-                                "arguments": "",
-                            }
-                        if tc.get("id"):
-                            accumulated_tool_calls[idx]["id"] = tc["id"]
-                        fn = tc.get("function")
-                        if fn:
-                            if fn.get("name"):
-                                accumulated_tool_calls[idx]["name"] = fn["name"]
-                            if fn.get("arguments"):
-                                accumulated_tool_calls[idx]["arguments"] += fn["arguments"]
-
-                fr = choice.get("finish_reason")
-                if fr:
-                    finish_reason = "tool_use" if fr in ("tool_calls", "function_call") else ("end_turn" if fr == "stop" else fr)
-
-    total_text = "".join(full_text)
-    out_tokens = max(1, len(total_text) // 4)
-    in_tokens = sum(len(str(m.get("content", ""))) // 4 for m in conv_messages)
-
-    content_blocks: list[dict[str, Any]] = []
-    if total_text:
-        content_blocks.append({"type": "text", "text": total_text})
-    for tc in accumulated_tool_calls.values():
         try:
-            parsed_input = _json.loads(tc["arguments"] or "{}")
-        except Exception:
-            parsed_input = {"raw": tc["arguments"]}
-        content_blocks.append({
-            "type": "tool_use",
-            "id": tc["id"] or f"toolu_{tc['name']}_{id(tc)}",
-            "name": tc["name"],
-            "input": parsed_input,
-        })
+            _logger.info("[AGENT] Trying Gemini model: %s", gem_model)
+            async with httpx.AsyncClient(timeout=35.0) as client:
+                async with client.stream("POST", url, headers=headers, json=body) as response:
+                    if response.status_code in (429, 503, 404):
+                        raw_err = await response.aread()
+                        _logger.warning(
+                            "[AGENT] Gemini model %s returned %d: %s. Trying next model...",
+                            gem_model,
+                            response.status_code,
+                            raw_err.decode("utf-8", errors="replace")[:150],
+                        )
+                        continue
+                    if response.status_code != 200:
+                        raw_err = await response.aread()
+                        _logger.warning(
+                            "[AGENT] Gemini model %s failed (%d). Trying next model...",
+                            gem_model,
+                            response.status_code,
+                        )
+                        continue
 
-    yield {
-        "type": "final",
-        "stop_reason": finish_reason,
-        "content": content_blocks if content_blocks else [{"type": "text", "text": total_text}],
-        "usage": {
-            "input_tokens": in_tokens,
-            "output_tokens": out_tokens,
-            "cache_read_tokens": 0,
-        },
-    }
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            chunk = _json.loads(data_str)
+                        except Exception:
+                            continue
+
+                        if not chunk.get("choices"):
+                            continue
+                        choice = chunk["choices"][0]
+                        delta = choice.get("delta") or {}
+
+                        # Text delta
+                        if delta.get("content"):
+                            c_delta = delta["content"]
+                            full_text.append(c_delta)
+                            yield {"type": "text", "delta": c_delta}
+
+                        # Tool calls
+                        if delta.get("tool_calls"):
+                            for tc in delta["tool_calls"]:
+                                idx = tc.get("index", 0)
+                                if idx not in accumulated_tool_calls:
+                                    accumulated_tool_calls[idx] = {
+                                        "id": tc.get("id") or "",
+                                        "name": tc.get("function", {}).get("name") if tc.get("function") else "",
+                                        "arguments": "",
+                                    }
+                                if tc.get("id"):
+                                    accumulated_tool_calls[idx]["id"] = tc["id"]
+                                fn = tc.get("function")
+                                if fn:
+                                    if fn.get("name"):
+                                        accumulated_tool_calls[idx]["name"] = fn["name"]
+                                    if fn.get("arguments"):
+                                        accumulated_tool_calls[idx]["arguments"] += fn["arguments"]
+
+                        fr = choice.get("finish_reason")
+                        if fr:
+                            finish_reason = "tool_use" if fr in ("tool_calls", "function_call") else ("end_turn" if fr == "stop" else fr)
+
+            total_text = "".join(full_text)
+            out_tokens = max(1, len(total_text) // 4)
+            in_tokens = sum(len(str(m.get("content", ""))) // 4 for m in conv_messages)
+
+            content_blocks: list[dict[str, Any]] = []
+            if total_text:
+                content_blocks.append({"type": "text", "text": total_text})
+            for tc in accumulated_tool_calls.values():
+                try:
+                    parsed_input = _json.loads(tc["arguments"] or "{}")
+                except Exception:
+                    parsed_input = {"raw": tc["arguments"]}
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": tc["id"] or f"toolu_{tc['name']}_{id(tc)}",
+                    "name": tc["name"],
+                    "input": parsed_input,
+                })
+
+            yield {
+                "type": "final",
+                "stop_reason": finish_reason,
+                "content": content_blocks if content_blocks else [{"type": "text", "text": total_text}],
+                "usage": {
+                    "input_tokens": in_tokens,
+                    "output_tokens": out_tokens,
+                    "cache_read_tokens": 0,
+                },
+            }
+            return
+        except Exception as e:
+            _logger.warning("[AGENT] Error streaming with Gemini %s: %s. Trying next...", gem_model, e)
+            last_error = e
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("All Gemini candidate models exhausted or unavailable.")
 
 
 async def _complete_gemini(
     conv_messages: list[dict[str, Any]],
     max_tokens: int | None = None,
 ) -> str:
-    """Non-streaming call to Gemini for JSON/summaries."""
+    """Non-streaming call to Gemini for JSON/summaries with model cascade."""
     url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
     headers = {
         "Authorization": f"Bearer {settings.GEMINI_API_KEY}",
         "Content-Type": "application/json",
     }
-    body: dict[str, Any] = {
-        "model": settings.MODEL_GEMINI or "gemini-2.5-flash",
-        "messages": conv_messages,
-        "temperature": 0.1,
-    }
-    if max_tokens:
-        body["max_tokens"] = max_tokens
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(url, headers=headers, json=body)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"] or ""
+    models_to_try = []
+    if settings.MODEL_GEMINI and settings.MODEL_GEMINI not in models_to_try:
+        models_to_try.append(settings.MODEL_GEMINI)
+    for m in GEMINI_CANDIDATE_MODELS:
+        if m not in models_to_try:
+            models_to_try.append(m)
+
+    for gem_model in models_to_try:
+        body: dict[str, Any] = {
+            "model": gem_model,
+            "messages": conv_messages,
+            "temperature": 0.1,
+        }
+        if max_tokens:
+            body["max_tokens"] = max_tokens
+        try:
+            async with httpx.AsyncClient(timeout=25.0) as client:
+                resp = await client.post(url, headers=headers, json=body)
+                if resp.status_code in (429, 503, 404):
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"] or ""
+        except Exception:
+            continue
+
+    return "{}"
 
 
 class Llm:
@@ -248,6 +309,12 @@ class Llm:
         errors, automatically fails over to Google Gemini. If all providers fail, returns a safe
         in-band response so execution never terminates with an unhandled exception.
         """
+        _logger.info("[AGENT] ===== STARTING STREAM TURN =====")
+        _logger.info("[AGENT] Model: %s", model)
+        _logger.info("[AGENT] Max tokens: %s", max_tokens)
+        _logger.info("[AGENT] Number of messages: %d", len(messages))
+        _logger.info("[AGENT] Number of tools: %d", len(tools) if tools else 0)
+        
         system_text = _format_system(system)
         conv_messages = _format_messages_for_groq(messages, system_text)
         groq_tools = _convert_tools_for_groq(tools) if tools else None
@@ -256,6 +323,7 @@ class Llm:
         groq_attempted = False
         if groq_client is not None:
             groq_attempted = True
+            _logger.info("[AGENT] Attempting Groq as primary provider")
             create_kwargs: dict[str, Any] = dict(
                 model=model,
                 messages=conv_messages,
@@ -270,10 +338,13 @@ class Llm:
             max_retries = 1
             for attempt in range(max_retries + 1):
                 try:
+                    _logger.info("[AGENT] Groq attempt %d/%d", attempt + 1, max_retries + 1)
                     stream = await groq_client.chat.completions.create(**create_kwargs)
+                    _logger.info("[AGENT] Groq stream created successfully")
                     break
                 except Exception as e:
                     err_str = str(e)
+                    _logger.error("[AGENT] Groq request failed: %s", err_str)
                     # If rate limited (429) or token limit exceeded (413), try short pause or fall through to Gemini
                     if ("429" in err_str or "rate_limit" in err_str.lower()) and attempt < max_retries:
                         m = re.search(r"try again in ([\d\.]+)s", err_str)
@@ -287,11 +358,14 @@ class Llm:
 
             if stream is not None:
                 try:
+                    _logger.info("[AGENT] Reading Groq stream...")
                     finish_reason = "end_turn"
                     accumulated_tool_calls: dict[int, dict[str, Any]] = {}
                     full_text = []
+                    chunk_count = 0
 
                     async for chunk in stream:
+                        chunk_count += 1
                         if not chunk.choices:
                             continue
                         choice = chunk.choices[0]
@@ -324,6 +398,7 @@ class Llm:
                             fr = choice.finish_reason
                             finish_reason = "tool_use" if fr in ("tool_calls", "function_call") else ("end_turn" if fr == "stop" else fr)
 
+                    _logger.info("[AGENT] Groq stream finished. Chunks: %d", chunk_count)
                     total_text = "".join(full_text)
                     out_tokens = max(1, len(total_text) // 4)
                     in_tokens = sum(len(str(m.get("content", ""))) // 4 for m in conv_messages)
@@ -344,6 +419,7 @@ class Llm:
                             "input": parsed_input,
                         })
 
+                    _logger.info("[AGENT] Groq SUCCESS. Stop reason: %s, Tool calls: %d", finish_reason, len(accumulated_tool_calls))
                     yield {
                         "type": "final",
                         "stop_reason": finish_reason,
@@ -361,17 +437,23 @@ class Llm:
         # Fallback 1: Google Gemini (High TPM, fast, reliable fallback)
         if settings.GEMINI_API_KEY:
             try:
-                _logger.info("[AGENT] Using Gemini (%s) as fallback...", settings.MODEL_GEMINI)
+                _logger.info("[AGENT] ===== SWITCHING TO GEMINI FALLBACK =====")
+                _logger.info("[AGENT] Gemini model: %s", settings.MODEL_GEMINI)
+                _logger.info("[AGENT] Gemini API key detected")
                 async for chunk in _stream_gemini(conv_messages, groq_tools, max_tokens):
                     yield chunk
+                _logger.info("[AGENT] Gemini fallback completed successfully")
                 return
             except Exception as e:
                 _logger.error("[AGENT] Gemini fallback failed: %s", e)
+        else:
+            _logger.warning("[AGENT] No Gemini API key available")
 
         # Fallback 2: Anthropic (if key provided and valid)
         if settings.ANTHROPIC_API_KEY and not settings.ANTHROPIC_API_KEY.startswith("dummy"):
             try:
-                _logger.info("[AGENT] Trying Anthropic provider as secondary fallback...")
+                _logger.info("[AGENT] ===== SWITCHING TO ANTHROPIC FALLBACK =====")
+                _logger.info("[AGENT] Anthropic model: %s", model)
                 anthropic_client = _get_anthropic_client()
                 kwargs: dict[str, Any] = dict(
                     model=model, max_tokens=max_tokens, system=system, messages=messages
@@ -382,6 +464,7 @@ class Llm:
                     async for delta in stream.text_stream:
                         yield {"type": "text", "delta": delta}
                     final = await stream.get_final_message()
+                _logger.info("[AGENT] Anthropic fallback completed successfully")
                 yield {
                     "type": "final",
                     "stop_reason": final.stop_reason,
@@ -395,6 +478,8 @@ class Llm:
                 return
             except Exception as e:
                 _logger.error("[AGENT] Anthropic secondary fallback failed: %s", e)
+        else:
+            _logger.warning("[AGENT] No valid Anthropic API key available")
 
         # Ultimate safety fallback: Ensure execution never crashes and user gets a helpful message
         _logger.critical("[AGENT] All LLM providers exhausted or failed. Yielding graceful fallback turn.")
@@ -412,6 +497,9 @@ class Llm:
 
     async def complete_json(self, *, model, system, user, max_tokens) -> str:
         """One non-streamed call for review, classify and summarize. Returns raw text."""
+        _logger.info("[AGENT] ===== STARTING COMPLETE_JSON =====")
+        _logger.info("[AGENT] Model: %s, Max tokens: %s", model, max_tokens)
+        
         system_text = _format_system(system)
         conv_messages = _format_messages_for_groq(
             [{"role": "user", "content": user}], system_text
@@ -420,33 +508,43 @@ class Llm:
         groq_client = _get_groq_client()
         if groq_client is not None:
             try:
+                _logger.info("[AGENT] complete_json: Attempting Groq")
                 resp = await groq_client.chat.completions.create(
                     model=model,
                     max_tokens=max_tokens,
                     messages=conv_messages,
                     temperature=0.1,
                 )
-                return resp.choices[0].message.content or ""
+                result = resp.choices[0].message.content or ""
+                _logger.info("[AGENT] complete_json: Groq SUCCESS. Response length: %d", len(result))
+                return result
             except Exception as e:
-                _logger.warning("[AGENT] Groq complete_json failed: %s. Falling back to Gemini...", e)
+                _logger.error("[AGENT] complete_json: Groq failed: %s. Falling back to Gemini...", e)
 
         if settings.GEMINI_API_KEY:
             try:
-                return await _complete_gemini(conv_messages, max_tokens)
+                _logger.info("[AGENT] complete_json: Switching to Gemini")
+                result = await _complete_gemini(conv_messages, max_tokens)
+                _logger.info("[AGENT] complete_json: Gemini SUCCESS. Response length: %d", len(result))
+                return result
             except Exception as e:
-                _logger.error("[AGENT] Gemini complete_json fallback failed: %s", e)
+                _logger.error("[AGENT] complete_json: Gemini fallback failed: %s", e)
 
         if settings.ANTHROPIC_API_KEY and not settings.ANTHROPIC_API_KEY.startswith("dummy"):
             try:
+                _logger.info("[AGENT] complete_json: Switching to Anthropic")
                 anthropic_client = _get_anthropic_client()
                 resp = await anthropic_client.messages.create(
                     model=model, max_tokens=max_tokens, system=system,
                     messages=[{"role": "user", "content": user}],
                 )
-                return "".join(b.text for b in resp.content if b.type == "text")
+                result = "".join(b.text for b in resp.content if b.type == "text")
+                _logger.info("[AGENT] complete_json: Anthropic SUCCESS. Response length: %d", len(result))
+                return result
             except Exception as e:
-                _logger.error("[AGENT] Anthropic complete_json failed: %s", e)
+                _logger.error("[AGENT] complete_json: Anthropic failed: %s", e)
 
+        _logger.warning("[AGENT] complete_json: All providers failed, returning empty JSON")
         return "{}"
 
 
