@@ -25,8 +25,8 @@ export const BROWSER_TOOLS = [
   {
     name: 'type',
     description:
-      'Type text into an input field, textarea, or contenteditable element. ' +
-      'Use press_enter=true to submit forms or trigger searches.',
+      'Type text into a standard input field, search box, or textarea. ' +
+      'Do not use this to type documents into Word Online or Google Docs canvas. Use press_enter=true for search.',
     input_schema: {
       type: 'object',
       properties: {

@@ -51,7 +51,10 @@ async def step(body: StepRequest, user: CurrentUser = Depends(step_rate_limit)):
                 elif ev["type"] == "final":
                     # Count tool_use blocks for logging
                     content = ev.get("content", [])
-                    tool_use_count = sum(1 for c in content if isinstance(c, dict) and c.get("type") == "tool_use")
+                    tool_uses = [c for c in content if isinstance(c, dict) and c.get("type") == "tool_use"]
+                    tool_use_count = len(tool_uses)
+                    if tool_uses:
+                        logger.info("[AGENT] -> Tool calls emitted by LLM: %s", [(t.get("name"), t.get("input")) for t in tool_uses])
                     await record_usage(user.id, body.run_id, model_for("agent"), ev["usage"])
                     logger.info(
                         "[AGENT] <- Stream finished (%d text chunks, %d tool_use blocks, stop_reason=%s, usage=%s)",
@@ -66,6 +69,8 @@ async def step(body: StepRequest, user: CurrentUser = Depends(step_rate_limit)):
                 err_text = "Page content exceeded rate/token limit. Content has been optimized—please try again."
             elif "credit balance is too low" in msg.lower() or "billing" in msg.lower():
                 err_text = "LLM API credits depleted. Please verify your API key."
+            elif "connection" in msg.lower() or "timeout" in msg.lower() or "getaddrinfo" in msg.lower():
+                err_text = "Internet connection dropped or DNS resolution failed. Reconnected—please try again."
             else:
                 err_text = f"Upstream error: {msg[:100]}"
             yield frame("error", {"status": 502, "message": err_text})

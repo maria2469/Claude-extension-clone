@@ -118,7 +118,27 @@ class Llm:
                 create_kwargs["tools"] = groq_tools
                 create_kwargs["tool_choice"] = "auto"
 
-            stream = await groq_client.chat.completions.create(**create_kwargs)
+            import asyncio
+            import re
+            import logging
+            _logger = logging.getLogger(__name__)
+
+            stream = None
+            max_retries = 2
+            for attempt in range(max_retries + 1):
+                try:
+                    stream = await groq_client.chat.completions.create(**create_kwargs)
+                    break
+                except Exception as e:
+                    err_str = str(e)
+                    if ("429" in err_str or "rate_limit" in err_str.lower()) and attempt < max_retries:
+                        m = re.search(r"try again in ([\d\.]+)s", err_str)
+                        wait_sec = float(m.group(1)) + 1.0 if m else 4.0
+                        _logger.warning("[AGENT] 429 rate limit hit. Pausing %.1fs before retry (attempt %d/%d)...", wait_sec, attempt + 1, max_retries)
+                        await asyncio.sleep(wait_sec)
+                        continue
+                    raise e
+
             finish_reason = "end_turn"
             accumulated_tool_calls: dict[int, dict[str, Any]] = {}
 

@@ -211,7 +211,8 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
       // Re-extract DOM on each step (page may have changed)
       if (stepCount > 1) {
         const freshTab = await getActiveTabDetails();
-        if (freshTab.content) tabContent = freshTab.content;
+        // Keep follow-up page content compact so token usage does not balloon across steps
+        if (freshTab.content) tabContent = freshTab.content.slice(0, 4000);
         if (freshTab.url) tabUrl = freshTab.url;
       }
 
@@ -221,7 +222,8 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
       let finalTurn: any = null;
 
       try {
-        const toolsToSend = mode === 'auto' ? BROWSER_TOOLS : [];
+        // Provide browser tools so the model can act autonomously in both modes
+        const toolsToSend = BROWSER_TOOLS;
         finalTurn = await streamStep(
           conversationMessages,
           toolsToSend as any,
@@ -288,10 +290,15 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
         };
         setMessages((prev) => [...prev, actionMsg]);
 
-        // Check if this is a sensitive action requiring approval
-        const needsApproval = block.name === 'click' && isSensitiveClickTarget(block.input.ref || '');
+        // Check if this is an action requiring approval:
+        // In "manual" mode (Ask first), any mutating or navigating action asks for approval.
+        // In "auto" mode (Act with safety check), only sensitive buttons (buy/checkout/delete) ask for approval.
+        const isMutatingAction = ['click', 'type', 'navigate', 'open_tab', 'close_tab'].includes(block.name);
+        const isSensitiveClick = block.name === 'click' && isSensitiveClickTarget(block.input.ref || '');
+        const needsApproval = mode === 'manual' ? isMutatingAction : isSensitiveClick;
+
         if (needsApproval) {
-          const origin = tabUrl ? new URL(tabUrl).hostname : 'this page';
+          const origin = tabUrl ? new URL(tabUrl).hostname : 'this browser';
           const approvalId = `appr-${Date.now()}`;
           const summary = `${formatToolLabel(block.name, block.input)} on ${origin}`;
           const allowed = await requestApproval(approvalId, summary, origin);
@@ -315,14 +322,14 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
           break;
         }
 
-        // Small pause between actions for stability
-        await new Promise((r) => setTimeout(r, 300));
+        // Pause between actions for stability, DOM settling, and TPM rate limit safety
+        await new Promise((r) => setTimeout(r, 1200));
       }
 
       if (abortRef.current) break;
 
       // Feed tool results back into conversation for next step
-      conversationMessages = [
+      const nextMessages = [
         ...conversationMessages,
         {
           role: 'assistant',
@@ -336,6 +343,17 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
           content: toolResults,
         },
       ];
+
+      // Sliding window compaction: Retain initial user goal + last 4 messages (2 recent turns)
+      // to keep token count compact across multi-step execution.
+      if (nextMessages.length > 5) {
+        conversationMessages = [
+          nextMessages[0],
+          ...nextMessages.slice(-4),
+        ];
+      } else {
+        conversationMessages = nextMessages;
+      }
     }
 
     if (stepCount >= MAX_STEPS) {
