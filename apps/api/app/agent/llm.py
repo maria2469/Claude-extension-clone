@@ -111,7 +111,7 @@ class Llm:
             create_kwargs: dict[str, Any] = dict(
                 model=model,
                 messages=conv_messages,
-                max_tokens=max_tokens,
+                max_tokens=min(max_tokens or 2048, 1024),
                 stream=True,
             )
             if groq_tools:

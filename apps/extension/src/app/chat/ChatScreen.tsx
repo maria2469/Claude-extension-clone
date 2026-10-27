@@ -68,7 +68,7 @@ async function getActiveTabDetails(): Promise<{
               .replace(/[ \t]+/g, ' ')
               .replace(/\n\s*\n+/g, '\n')
               .trim()
-              .slice(0, 30000);
+              .slice(0, 10000);
           },
         });
         return { tabId, url, title: title || null, content: results?.[0]?.result || null };

@@ -29,9 +29,13 @@ def system_blocks(
     ]
 
     if page_content and page_content.strip():
+        # Truncate content to avoid exceeding LLM context or TPM limits (Groq free tier has 8k TPM limit)
+        trimmed = page_content.strip()
+        if len(trimmed) > 10000:
+            trimmed = trimmed[:10000] + "\n\n... [Content truncated to fit context limits] ..."
         blocks.append({
             "type": "text",
-            "text": f"=== Active Browser Tab Content ===\n{page_content.strip()}\n=== End Active Browser Tab Content ===",
+            "text": f"=== Active Browser Tab Content ===\n{trimmed}\n=== End Active Browser Tab Content ===",
         })
 
     return blocks

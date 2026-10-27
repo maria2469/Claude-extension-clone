@@ -35,7 +35,7 @@ export function extractInteractiveDom(): {
       .replace(/[ \t]+/g, ' ')
       .replace(/\n\s*\n+/g, '\n')
       .trim()
-      .slice(0, 30000);
+      .slice(0, 10000);
   }
 
   // 2. Query all potentially interactive elements
@@ -144,8 +144,8 @@ export function extractInteractiveDom(): {
     if (info.disabled) desc += ' (disabled)';
     lines.push(desc);
 
-    // Limit to top 150 interactive elements to stay token-compact
-    if (lines.length >= 150) break;
+    // Limit to top 60 interactive elements to stay token-compact
+    if (lines.length >= 60) break;
   }
 
   const treeText = lines.join('\n');

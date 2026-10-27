@@ -61,7 +61,14 @@ async def step(body: StepRequest, user: CurrentUser = Depends(step_rate_limit)):
                     yield frame("final", {k: v for k, v in ev.items() if k != "type"})
         except Exception as e:  # stream already started, so report in-band
             logger.exception("[AGENT] Upstream error in stream_turn: %s", e)
-            yield frame("error", {"status": 502, "message": "upstream_error"})
+            msg = str(e)
+            if "rate_limit" in msg.lower() or "413" in msg or "too large" in msg.lower():
+                err_text = "Page content exceeded rate/token limit. Content has been optimized—please try again."
+            elif "credit balance is too low" in msg.lower() or "billing" in msg.lower():
+                err_text = "LLM API credits depleted. Please verify your API key."
+            else:
+                err_text = f"Upstream error: {msg[:100]}"
+            yield frame("error", {"status": 502, "message": err_text})
 
     # X-Accel-Buffering stops nginx-style proxies from buffering the stream.
     return StreamingResponse(
